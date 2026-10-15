@@ -1,0 +1,23 @@
+{
+  "domain": "compass_console",
+  "name": "Lippert OneControl (BLE)",
+  "bluetooth": [
+    {
+      "local_name": "LCIRemotec*"
+    }
+  ],
+  "codeowners": [
+    "@davilaa"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "bluetooth_adapters"
+  ],
+  "documentation": "https://github.com/davilaa/ha-lippert-onecontrol-ble",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/davilaa/ha-lippert-onecontrol-ble/issues",
+  "requirements": [
+    "bleak-retry-connector>=3.4.0"
+  ],
+  "version": "0.1.0"
+}

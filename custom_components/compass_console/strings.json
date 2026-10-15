@@ -1,0 +1,18 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Lippert OneControl (BLE)",
+        "description": "Connect to the Lippert OneControl console over Bluetooth. If the console isn't paired yet, finish setup anyway, put the console in pairing mode, then press the \"Pair / Re-pair Console\" button on the device page and accept the prompt on the console's screen.",
+        "data": {
+          "address": "Bluetooth MAC address",
+          "scan_interval": "State poll interval (seconds)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This console is already configured."
+    }
+  }
+}
