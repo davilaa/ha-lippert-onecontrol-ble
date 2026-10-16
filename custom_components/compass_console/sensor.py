@@ -1,4 +1,5 @@
-"""Sensor platform: tank fill levels (Fresh / Grey / Black) as percentage sensors."""
+"""Sensor platform: tank levels, load currents, faults, and every read-only value the IDS-CAN
+devices report (temperatures, battery / power monitors, hour meters, chassis, door locks...)."""
 from __future__ import annotations
 
 import logging
@@ -9,12 +10,20 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfElectricCurrent
+from homeassistant.const import (
+    PERCENTAGE,
+    EntityCategory,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfTemperature,
+    UnitOfTime,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from . import protocol as P
 from .const import DOMAIN, TANK_DEFAULT_ICON, TANK_ICONS
 from .coordinator import CompassCoordinator
 
@@ -58,6 +67,13 @@ async def async_setup_entry(
             if dev.current is not None and ("cur:" + dev.key) not in known:
                 known.add("cur:" + dev.key)
                 new.append(CompassCurrentSensor(coordinator, dev))
+            data = dev.data
+            for desc in VALUE_SENSORS.get(dev.kind, ()):
+                tag = f"{desc.field}:{dev.key}"
+                if tag in known or not data or data.get(desc.field) is None:
+                    continue   # only create sensors for values this device actually reports
+                known.add(tag)
+                new.append(CompassValueSensor(coordinator, dev, desc))
         if new:
             async_add_entities(new)
 
@@ -238,3 +254,141 @@ class CompassFaultSensor(CoordinatorEntity[CompassCoordinator], SensorEntity):
     def extra_state_attributes(self) -> dict:
         faults = self._faults()
         return {"fault_count": len(faults), "faults": faults}
+
+
+class _Desc:
+    """What to read from a device's decoded status and how to present it."""
+
+    def __init__(self, field, suffix, device_class=None, unit=None, state_class=None,
+                 precision=None, options=None, icon=None, category=None, scale=None):
+        self.field = field
+        self.suffix = suffix
+        self.device_class = device_class
+        self.unit = unit
+        self.state_class = state_class
+        self.precision = precision
+        self.options = options
+        self.icon = icon
+        self.category = category
+        self.scale = scale
+
+
+_M = SensorStateClass.MEASUREMENT
+_V = UnitOfElectricPotential.VOLT
+_A = UnitOfElectricCurrent.AMPERE
+_DIAG = EntityCategory.DIAGNOSTIC
+VALUE_SENSORS = {
+    P.K_TANK: (
+        _Desc("battery", "Sensor Battery", SensorDeviceClass.BATTERY, PERCENTAGE, _M,
+              category=_DIAG),
+        _Desc("quality", "Signal Quality", None, PERCENTAGE, _M, icon="mdi:signal",
+              category=_DIAG),
+    ),
+    P.K_HOUR_METER: (
+        _Desc("hours", "Hours", SensorDeviceClass.DURATION, UnitOfTime.HOURS,
+              SensorStateClass.TOTAL_INCREASING, 1),
+    ),
+    P.K_GENERATOR: (
+        _Desc("state", "State", SensorDeviceClass.ENUM,
+              options=list(P.GEN_STATES.values()) + ["unknown"], icon="mdi:engine"),
+        _Desc("battery_v", "Battery", SensorDeviceClass.VOLTAGE, _V, _M, 2),
+        _Desc("temperature_f", "Temperature", SensorDeviceClass.TEMPERATURE,
+              UnitOfTemperature.FAHRENHEIT, _M, 1),
+    ),
+    P.K_TEMPERATURE: (
+        _Desc("temperature_c", "", SensorDeviceClass.TEMPERATURE, UnitOfTemperature.CELSIUS,
+              _M, 1),
+        _Desc("battery_pct", "Battery", SensorDeviceClass.BATTERY, PERCENTAGE, _M,
+              category=_DIAG),
+    ),
+    P.K_AC_POWER: (
+        _Desc("voltage", "Voltage", SensorDeviceClass.VOLTAGE, _V, _M, 1),
+        _Desc("current", "Current", SensorDeviceClass.CURRENT, _A, _M, 1),
+    ),
+    P.K_DC_POWER: (
+        _Desc("voltage", "Voltage", SensorDeviceClass.VOLTAGE, _V, _M, 2),
+        _Desc("current", "Current", SensorDeviceClass.CURRENT, _A, _M, 2),
+        _Desc("soc", "Charge", SensorDeviceClass.BATTERY, PERCENTAGE, _M),
+        _Desc("minutes_remaining", "Time Remaining", SensorDeviceClass.DURATION,
+              UnitOfTime.MINUTES, _M),
+    ),
+    P.K_BATTERY: (
+        _Desc("voltage", "Voltage", SensorDeviceClass.VOLTAGE, _V, _M, 2),
+        _Desc("current", "Current", SensorDeviceClass.CURRENT, _A, _M, 2),
+        _Desc("soc", "Charge", SensorDeviceClass.BATTERY, PERCENTAGE, _M),
+    ),
+    P.K_HVAC: (
+        _Desc("outdoor_f", "Outdoor Temperature", SensorDeviceClass.TEMPERATURE,
+              UnitOfTemperature.FAHRENHEIT, _M, 1),
+    ),
+    P.K_CHASSIS: (
+        _Desc("park_brake", "Park Brake", SensorDeviceClass.ENUM,
+              options=["released", "engaged"], icon="mdi:car-brake-parking"),
+        _Desc("ignition", "Ignition", SensorDeviceClass.ENUM, options=["on", "off"],
+              icon="mdi:key"),
+        _Desc("towable_battery_v", "Towable Battery", SensorDeviceClass.VOLTAGE, _V, _M, 1),
+        _Desc("towable_brake_v", "Towable Brake", SensorDeviceClass.VOLTAGE, _V, _M, 1),
+    ),
+    P.K_LOCK: (
+        _Desc("state", "", SensorDeviceClass.ENUM, options=["locked", "unlocked"],
+              icon="mdi:lock"),
+        _Desc("battery", "Battery", None, None, _M, icon="mdi:battery", category=_DIAG),
+    ),
+}
+
+
+class CompassValueSensor(CoordinatorEntity[CompassCoordinator], SensorEntity):
+    """One value from a device's decoded status (see VALUE_SENSORS)."""
+
+    _attr_has_entity_name = False
+
+    def __init__(self, coordinator: CompassCoordinator, device, desc: _Desc) -> None:
+        super().__init__(coordinator)
+        self._key = device.key
+        self._field = desc.field
+        self._attr_unique_id = f"{coordinator.address}_{device.kind}_{desc.field}_{device.key}"
+        name = device.name
+        if device.kind == P.K_CHASSIS:
+            name = "Chassis"
+        self._attr_name = f"{name} {desc.suffix}".strip()
+        self._attr_device_class = desc.device_class
+        self._attr_native_unit_of_measurement = desc.unit
+        self._attr_state_class = desc.state_class
+        if desc.precision is not None:
+            self._attr_suggested_display_precision = desc.precision
+        if desc.options:
+            self._attr_options = desc.options
+        if desc.icon:
+            self._attr_icon = desc.icon
+        if desc.category:
+            self._attr_entity_category = desc.category
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, coordinator.address)},
+            name="Compass Console",
+            manufacturer="Lippert / IDS",
+            model="OneControl IDS-CAN gateway",
+        )
+
+    @property
+    def _data(self):
+        dev = (self.coordinator.data or {}).get(self._key)
+        return dev.data if dev else None
+
+    @property
+    def available(self) -> bool:
+        d = self._data
+        return super().available and d is not None and d.get(self._field) is not None
+
+    @property
+    def native_value(self):
+        d = self._data
+        return d.get(self._field) if d else None
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        d = self._data
+        if not d:
+            return None
+        # Expose the device's remaining flags (alerts, maintenance due, ...) on its first sensor.
+        flags = {k: v for k, v in d.items() if isinstance(v, bool)}
+        return flags or None

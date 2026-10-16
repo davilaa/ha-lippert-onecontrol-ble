@@ -9,12 +9,11 @@ import time
 from bleak import BleakClient
 
 try:
-    from .tables import FN, DT
-except Exception:  # pragma: no cover - standalone import
-    try:
-        from tables import FN, DT
-    except Exception:
-        FN, DT = {}, {}
+    from . import protocol as P
+    from .tables import DT, FN, FNCLASS
+except ImportError:  # pragma: no cover - standalone import
+    import protocol as P
+    from tables import DT, FN, FNCLASS
 
 _LOG = logging.getLogger(__name__)
 
@@ -36,7 +35,6 @@ SESSION_WARM_SECONDS = 2          # hold a RemoteControl session open this long 
                                   # then END it. While we hold a session the device ignores its
                                   # physical console buttons, so keep this short (it only saves the
                                   # handshake on quick back-to-back taps / cover reversals)
-LATCHING_TYPES = {3, 30}          # latching relays = simple on/off switches
 ALIASES = {
     "ceiling": 61, "exterior": 143, "waterheater": 4, "ewh": 4,
     "electricwaterheater": 4, "gaswaterheater": 3, "gwh": 3,
@@ -133,19 +131,17 @@ def _build_justworks_agent():
     return _Agent()
 
 
-TANK_TYPE = 10          # DEVICE_TYPE.TANK_SENSOR; byte[19] = fill level percent (valid <=100)
-HBRIDGE_TYPES = {32, 33}  # LATCHING/MOMENTARY H-Bridge type 2 = slides / awnings (movement)
-# H-bridge COMMAND_MODE (ext byte of a COMMAND msg): 0=STOP, 1=FORWARD/extend, 2=REVERSE/retract
-MOVE_STOP, MOVE_FORWARD, MOVE_REVERSE = 0, 1, 2
+MOVE_STOP, MOVE_FORWARD, MOVE_REVERSE = P.MOVE_STOP, P.MOVE_FORWARD, P.MOVE_REVERSE
 
 
 class Device:
-    def __init__(self, addr, dtype, func, mac, inst, status, pid=0):
+    def __init__(self, addr, dtype, func, mac, inst, status, pid=0, caps=0):
         self.addr = addr
         self.dtype = dtype
         self.func = func
         self.mac = mac
         self.product_id = pid            # PRODUCT_ID wire code (module/controller model)
+        self.caps = caps                 # raw device-capability byte (meaning depends on type)
         self.dinst = (inst >> 4) & 0xF   # device instance
         self.finst = inst & 0xF          # function instance
         self.status = bytes(status)
@@ -153,8 +149,14 @@ class Device:
 
     @property
     def key(self):
-        """Stable identity across console power-cycles (CAN address changes, this doesn't)."""
-        return f"{self.func}_{self.dinst}_{self.finst}"
+        """Stable identity across console power-cycles (CAN address changes, this doesn't).
+        Devices on one module can share function + instances (a generator relay and its hour
+        meter), so newer kinds add the device type; relays / covers / tanks keep the original
+        format so existing entity IDs and saved cover settings stay valid."""
+        base = f"{self.func}_{self.dinst}_{self.finst}"
+        if self.kind in (P.K_RELAY, P.K_COVER, P.K_TANK, None):
+            return base
+        return f"{base}_t{self.dtype}"
 
     @property
     def name(self):
@@ -166,56 +168,86 @@ class Device:
         return DT.get(self.dtype, f"type{self.dtype}")
 
     @property
+    def fclass(self):
+        return FNCLASS[self.func] if 0 <= self.func < len(FNCLASS) else 0
+
+    @property
+    def kind(self):
+        """What this device is to us (protocol.K_*), or None if not exposed."""
+        return P.device_kind(self.dtype, self.fclass)
+
+    @property
     def is_switch(self):
-        return self.dtype in LATCHING_TYPES
+        return self.kind == P.K_RELAY
 
     @property
     def is_tank(self):
-        return self.dtype == TANK_TYPE
+        return self.kind == P.K_TANK
 
     @property
     def is_cover(self):
-        return self.dtype in HBRIDGE_TYPES
+        return self.kind == P.K_COVER
+
+    @property
+    def _is_output(self):
+        return self.kind in (P.K_RELAY, P.K_COVER, P.K_RELAY_GENERATOR)
 
     @property
     def position(self):
-        """Output position percent (byte[20]) if the device reports it, else None."""
-        return self.status[1] if len(self.status) >= 2 else None
+        """Output position percent if the device reports it, else None."""
+        return P.hbridge_position(self.dtype, self.status) if self._is_output else None
 
     @property
     def current(self):
-        """Output current draw in amps for relays / h-bridges (status[2:3] / 256), else None."""
-        if len(self.status) >= 4 and (self.is_switch or self.is_cover):
-            return ((self.status[2] << 8) | self.status[3]) / 256.0
-        return None
+        """Output current draw in amps for relays / h-bridges that report it, else None."""
+        return P.relay_current(self.dtype, self.status) if self._is_output else None
 
     @property
     def is_on(self):
-        return bool(self.state & 1)
+        return P.relay_is_on(self.dtype, self.status)
+
+    @property
+    def is_moving(self):
+        return P.hbridge_moving(self.dtype, self.status)
 
     @property
     def is_faulted(self):
-        """OutputDisabledLatch (status byte0 bit 5): the output is latched off by a fault.
-        While set, the controller ignores commands. Applies to relay + h-bridge outputs."""
-        return bool(self.state & 0x20) if (self.is_switch or self.is_cover) else False
+        """The output is latched off by a fault and ignores commands until cleared."""
+        return P.relay_faulted(self.dtype, self.status) if self._is_output else False
 
     @property
     def dtc_code(self):
-        """Raw diagnostic trouble code (UserMessage, status[4:5]); 0 = none reported."""
-        if len(self.status) >= 6:
-            return (self.status[4] << 8) | self.status[5]
+        """Raw diagnostic trouble code reported by the device; 0 = none."""
+        if self._is_output:
+            return P.relay_dtc(self.dtype, self.status)
+        if self.kind == P.K_GENERATOR:
+            g = P.generator(self.status)
+            return g["dtc"] if g else 0
         return 0
 
     @property
     def fill_level(self):
         """Tank fill percentage (0-100), or None if invalid/not a tank."""
-        if self.is_tank and self.status:
-            lvl = self.status[0]
-            return lvl if lvl <= 100 else None
-        return None
+        return P.tank_level(self.status) if self.is_tank else None
+
+    @property
+    def data(self):
+        """Decoded status for the richer device kinds (dict), or None."""
+        decoder = _DECODERS.get(self.kind)
+        return decoder(self.status) if decoder else None
 
     def __repr__(self):
         return f"<{self.name} 0x{self.addr:02x} type{self.dtype} state=0x{self.state:02x}>"
+
+
+_DECODERS = {
+    P.K_TANK: lambda s: {"level": P.tank_level(s), "battery": P.tank_battery(s),
+                         "quality": P.tank_quality(s)},
+    P.K_HOUR_METER: P.hour_meter, P.K_DIMMER: P.dimmer, P.K_RGB: P.rgb, P.K_RGBW: P.rgbw,
+    P.K_HVAC: P.hvac, P.K_GENERATOR: P.generator, P.K_TEMPERATURE: P.temperature,
+    P.K_AC_POWER: P.ac_power, P.K_DC_POWER: P.dc_power, P.K_FAN: P.fan,
+    P.K_CHASSIS: P.chassis, P.K_BATTERY: P.battery, P.K_LOCK: P.lock,
+}
 
 
 class CompassClient:
@@ -260,7 +292,8 @@ class CompassClient:
             status = b[19:19 + slen] if slen else b[19:20]
             self._devmap[b[1]] = Device(b[1], b[13], (b[14] << 8) | b[15],
                                         b[4:10].hex(), b[16], status,
-                                        (b[10] << 8) | b[11])  # product id (announce rx[0:1])
+                                        (b[10] << 8) | b[11],  # product id (announce rx[0:1])
+                                        b[17])                 # device capability byte
         s = _src_of(b)
         if s:
             self._inuse.add(s)
@@ -470,6 +503,11 @@ class CompassClient:
             return self._conn is not None and self._conn.is_connected
         except Exception:  # noqa: BLE001
             return False
+
+    @property
+    def devices(self):
+        """Live snapshot of every device currently heard on the bus."""
+        return list(self._devmap.values())
 
     @property
     def is_released(self):
@@ -738,7 +776,8 @@ class CompassClient:
                     if not await self._session_open(c, aa, addr):
                         raise RuntimeError("RemoteControl session did not open")
                 self._mark_session(addr)
-                await self._wr(c, _a29(130, aa, addr, 3, b""))  # command mode 3 = clear latch
+                ext, payload = P.clear_fault_cmd(self._devmap[addr].dtype)
+                await self._wr(c, _a29(130, aa, addr, ext, payload))  # clear the fault latch
                 self._touch_idle()
                 return True
             except Exception:  # noqa: BLE001
@@ -758,7 +797,7 @@ class CompassClient:
         return n
 
     async def async_move(self, key, direction, seconds, max_seconds=40.0,
-                         stall_amps=0.0, stall_hold=0.6, stall_arm=3.0):
+                         stall_amps=0.0, stall_hold=0.6, stall_arm=3.0, until=None):
         """Drive a momentary H-bridge (slide/awning) for ``seconds`` (or until stopped / link drop).
 
         If ``stall_amps`` > 0, also stop as soon as the motor current stays at/above that many
@@ -766,7 +805,8 @@ class CompassClient:
         end-stop. Returns ``(elapsed_seconds, stalled)``.
 
         direction: 1=extend/open, 2=retract/close. Returns the seconds actually run so the caller
-        can estimate position from run-time.
+        can estimate position from run-time. ``until`` is an optional callable checked every
+        pulse; the move ends as soon as it returns True.
 
         Two things keep the motor moving smoothly:
           * a fast write-without-response movement pulse every 0.2s (the momentary motor stalls if
@@ -797,6 +837,9 @@ class CompassClient:
                             if not await self._session_open(c, aa, addr):
                                 raise RuntimeError("RemoteControl session did not open")
                     self._mark_session(addr)  # keep this cover hot for an instant next command
+                    dev = self._devmap[addr]
+                    m_ext, m_pl = P.move_cmd(dev.dtype, direction, dev.fclass, FN.get(dev.func, ""))
+                    s_ext, s_pl = P.move_cmd(dev.dtype, MOVE_STOP)
                     t0 = _time.monotonic()
                     end = t0 + run_for
                     last_hb = t0
@@ -804,6 +847,8 @@ class CompassClient:
                     while not stop.is_set():
                         now = _time.monotonic()
                         if now >= end:
+                            break
+                        if until is not None and until():
                             break
                         if now - last_hb >= 2.5:
                             try:
@@ -826,7 +871,7 @@ class CompassClient:
                                 stall_since = None
                         self._mark_session(addr)  # don't let the heartbeat END it mid-travel
                         try:
-                            await self._wr_nr(c, _a29(130, aa, addr, direction, b""))  # movement pulse
+                            await self._wr_nr(c, _a29(130, aa, addr, m_ext, m_pl))  # movement pulse
                         except Exception:  # noqa: BLE001
                             await self._teardown_warm()  # link dropped -> motor stops itself
                             break
@@ -834,7 +879,7 @@ class CompassClient:
                     elapsed = _time.monotonic() - t0
                     try:
                         if self._conn is not None:
-                            await self._wr(c, _a29(130, aa, addr, MOVE_STOP, b""))
+                            await self._wr(c, _a29(130, aa, addr, s_ext, s_pl))
                     except Exception:  # noqa: BLE001
                         pass
                     self._mark_session(addr)  # stay hot so an immediate reverse is instant
@@ -889,7 +934,8 @@ class CompassClient:
             if not await self._session_open(c, aa, addr):
                 raise RuntimeError("RemoteControl session did not open")
         self._mark_session(addr)
-        await self._wr(c, _a29(130, aa, addr, 1 if on else 0, b""))  # command
+        ext, payload = P.relay_cmd(self._devmap[addr].dtype, on)
+        await self._wr(c, _a29(130, aa, addr, ext, payload))  # command
         self._mark_session(addr)  # keep this device hot for an instant next command
         # Brief best-effort confirm. Relays re-broadcast promptly when a load appears (ON)
         # but go quiet when it drops (OFF), so don't block on it -- the switch entity is
@@ -897,13 +943,57 @@ class CompassClient:
         ok = False
         for _ in range(12):
             await asyncio.sleep(0.1)
-            st = self._devmap[addr].state
-            if (on and st & 1) or ((not on) and not st & 1):
+            if self._devmap[addr].is_on == on:
                 ok = True
                 break
         _LOG.debug("compass: 0x%02x on=%s ok=%s state=0x%02x", addr, on, ok, self._devmap[addr].state)
         self._touch_idle()
         return ok, self._devmap.get(addr)
+
+    async def async_command(self, key, command, confirm=None, timeout=3.0):
+        """Send one device command ``(command_byte, data)`` (see protocol.*_cmd) to the device
+        with this key. Like the app's command runner, it re-sends every ~250 ms until
+        ``confirm(device)`` is True or ``timeout`` expires. Returns True if confirmed (or sent,
+        when no confirm callable is given)."""
+        ext, payload = command
+        async with self._lock:
+            last = None
+            for _attempt in range(2):
+                try:
+                    c, aa = await self._ensure_warm()
+                    addr = self._resolve(f"key:{key}")
+                    if addr is None or addr not in self._devmap:
+                        raise RuntimeError(f"device '{key}' not found on bus")
+                    if not self._session_warm(addr):
+                        if not await self._session_open(c, aa, addr):
+                            raise RuntimeError("RemoteControl session did not open")
+                    self._mark_session(addr)
+                    frame = _a29(130, aa, addr, ext, payload)
+                    await self._wr(c, frame)
+                    if confirm is None:
+                        self._touch_idle()
+                        return True
+                    deadline = time.monotonic() + timeout
+                    while time.monotonic() < deadline:
+                        await asyncio.sleep(0.25)
+                        dev = self._devmap.get(addr)
+                        if dev is not None and confirm(dev):
+                            self._touch_idle()
+                            return True
+                        self._mark_session(addr)
+                        await self._wr_nr(c, frame)
+                    self._touch_idle()
+                    return False
+                except Exception as e:  # noqa: BLE001
+                    last = e
+                    try:
+                        dead = self._conn is None or not self._conn.is_connected
+                    except Exception:  # noqa: BLE001
+                        dead = True
+                    if dead:
+                        await self._teardown_warm()
+                    await asyncio.sleep(1.0)
+            raise last if last else RuntimeError("command failed")
 
 
 if __name__ == "__main__":

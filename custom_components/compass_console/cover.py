@@ -30,6 +30,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from . import protocol as P
 from .compass_ble import MOVE_FORWARD, MOVE_REVERSE
 from .const import (
     COVER_DEFAULT_ICON,
@@ -45,8 +46,15 @@ from .coordinator import CompassCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-# Awning function ids -> awning device class; slides get the generic cover class.
-_AWNING_FUNCS = {105, 138, 139, 140}
+# FUNCTION_CLASS -> cover device class (slides and anything else get the generic class).
+_CLASS_DEVICE_CLASS = {
+    2: CoverDeviceClass.AWNING,      # AWNING
+    27: CoverDeviceClass.DOOR,       # DOOR (incl. ramp doors)
+    14: CoverDeviceClass.DAMPER,     # VENT_COVER
+}
+# Jacks: exposed like slides (the app drives them the same way) but disabled by default, so
+# nobody can move a jack from HA without deliberately enabling the entity first.
+_DISABLED_BY_DEFAULT_CLASSES = {6, 24}   # LANDING_GEAR, STABILIZER
 
 
 async def async_setup_entry(
@@ -59,11 +67,16 @@ async def async_setup_entry(
 
     @callback
     def _sync() -> None:
-        new = [
-            CompassCover(coordinator, dev)
-            for dev in (coordinator.data or {}).values()
-            if dev.is_cover and not (dev.key in known or known.add(dev.key))
-        ]
+        new = []
+        for dev in (coordinator.data or {}).values():
+            if dev.key in known:
+                continue
+            if dev.is_cover:
+                known.add(dev.key)
+                new.append(CompassCover(coordinator, dev))
+            elif dev.kind == P.K_FAN and dev.caps & 0x11:   # fan with a powered lid
+                known.add(dev.key)
+                new.append(CompassVentLid(coordinator, dev))
         if new:
             async_add_entities(new)
 
@@ -103,8 +116,10 @@ class CompassCover(CoordinatorEntity[CompassCoordinator], RestoreEntity, CoverEn
         self._attr_unique_id = f"{coordinator.address}_cover_{device.key}"
         self._attr_name = device.name
         self._attr_icon = COVER_ICONS.get(device.func, COVER_DEFAULT_ICON)
-        if device.func in _AWNING_FUNCS:
-            self._attr_device_class = CoverDeviceClass.AWNING
+        if device.fclass in _CLASS_DEVICE_CLASS:
+            self._attr_device_class = _CLASS_DEVICE_CLASS[device.fclass]
+        if device.fclass in _DISABLED_BY_DEFAULT_CLASSES:
+            self._attr_entity_registry_enabled_default = False
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, coordinator.address)},
             name="Compass Console",
@@ -283,3 +298,65 @@ class CompassCover(CoordinatorEntity[CompassCoordinator], RestoreEntity, CoverEn
                 self._write_state()
         except asyncio.CancelledError:
             pass
+
+
+class CompassVentLid(CoordinatorEntity[CompassCoordinator], CoverEntity):
+    """The powered lid of a roof fan. It reports its real position (0/25/50/75/100 %)."""
+
+    _attr_has_entity_name = False
+    _attr_device_class = CoverDeviceClass.DAMPER
+
+    def __init__(self, coordinator: CompassCoordinator, device) -> None:
+        super().__init__(coordinator)
+        self._key = device.key
+        self._quarter = bool(device.caps & 0x10)
+        self._attr_unique_id = f"{coordinator.address}_vent_{device.key}"
+        self._attr_name = f"{device.name} Lid"
+        features = CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE
+        if self._quarter:
+            features |= CoverEntityFeature.SET_POSITION
+        self._attr_supported_features = features
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, coordinator.address)},
+            name="Compass Console",
+            manufacturer="Lippert / IDS",
+            model="OneControl IDS-CAN gateway",
+        )
+
+    @property
+    def _vent(self):
+        dev = (self.coordinator.data or {}).get(self._key)
+        d = dev.data if dev else None
+        return d["vent"] if d else None
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._vent is not None
+
+    @property
+    def current_cover_position(self) -> int | None:
+        return self._vent
+
+    @property
+    def is_closed(self) -> bool | None:
+        v = self._vent
+        return None if v is None else v == 0
+
+    async def _go(self, position: int) -> None:
+        cmd = P.fan_vent_cmd(position)
+        want = cmd[1][0]
+        try:
+            await self.coordinator.client.async_command(
+                self._key, cmd, lambda dev: bool(dev.data) and dev.data["vent"] == want, 5.0)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Compass %s lid command failed: %s", self.name, err)
+        await self.coordinator.async_request_refresh()
+
+    async def async_open_cover(self, **kwargs) -> None:
+        await self._go(100)
+
+    async def async_close_cover(self, **kwargs) -> None:
+        await self._go(0)
+
+    async def async_set_cover_position(self, **kwargs) -> None:
+        await self._go(int(kwargs[ATTR_POSITION]))

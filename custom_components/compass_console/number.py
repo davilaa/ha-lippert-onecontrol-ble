@@ -60,7 +60,8 @@ async def async_setup_entry(
             if ("tclose:" + dev.key) not in known:
                 known.add("tclose:" + dev.key)
                 new.append(CompassTravelNumber(coordinator, entry, dev, opening=False))
-            if dev.func in COVER_STALL_FUNCS and ("stall:" + dev.key) not in known:
+            if (dev.func in COVER_STALL_FUNCS and dev.current is not None
+                    and ("stall:" + dev.key) not in known):
                 known.add("stall:" + dev.key)
                 new.append(CompassStallNumber(coordinator, entry, dev))
         if new:

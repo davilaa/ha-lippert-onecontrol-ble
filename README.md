@@ -7,24 +7,53 @@ no cloud.
 > Not affiliated with or endorsed by Lippert Components. The protocol was worked out
 > independently for interoperability. Use at your own risk, especially with slides and awnings.
 
-## What you get
+## Supported devices
 
-| Platform | Entities |
-|---|---|
-| Switch | Every latching relay on the bus: lights, water heaters, water pump, … |
-| Cover | Slides and awnings (position is **estimated** from run time) |
-| Sensor | Tank levels, per-load current draw, Connection Status, Fault Status (decoded DTCs) |
-| Button | Pair / Re-pair Console, Emergency Stop, Clear All Faults |
-| Number | Per-cover Open/Close Travel Time, Position calibration, Stall Current |
-| Switch (config) | **HA Console Control**: hand the console to the phone app and back |
+The integration discovers everything on the console's IDS-CAN bus and creates entities for
+each device type it understands. Status layouts and commands follow the official app's own
+device code.
+
+| Device | Home Assistant entities | Status |
+|---|---|---|
+| Latching relays, type 2 (lights, water heaters, pumps, …) | Switch, current sensor | ✅ Verified |
+| Slides & awnings (momentary H-bridge, type 2) | Cover with estimated position, travel-time / position / stall-current numbers, current sensor | ✅ Verified |
+| Tank sensors | Level %; battery + signal quality for wireless senders | ✅ Verified (level) |
+| Latching relays, type 1 (older modules) | Switch | 🧪 Experimental |
+| Slides, awnings, doors, vent covers on type 1 H-bridges | Cover | 🧪 Experimental |
+| Landing gear / stabilizer jacks | Cover, **disabled by default** (enable deliberately) | 🧪 Experimental |
+| Dimmable lights | Light: brightness, Blink / Swell effects | 🧪 Experimental |
+| RGB lights | Light: colour, Blink / Jump / Fade / Rainbow effects | 🧪 Experimental |
+| RGBW lights | Light: hue / saturation / brightness, effects | 🧪 Experimental |
+| HVAC zones (thermostats) | Climate: off / heat / cool / heat-cool / schedule, fan, gas vs heat-pump preset; outdoor temp sensor | 🧪 Experimental |
+| Generator Genie | Switch (start / stop), state, battery, temperature | 🧪 Experimental |
+| Generator on an H-bridge relay | Start / Stop buttons (held until the hour meter confirms) | 🧪 Experimental |
+| Roof fans (e.g. MaxxFan) | Fan: speed, direction; lid as a cover | 🧪 Experimental |
+| Hour meters | Hours (+ running / maintenance flags) | 🧪 Experimental |
+| Temperature sensors | Temperature, sensor battery | 🧪 Experimental |
+| Battery monitors | Voltage, current, state of charge | 🧪 Experimental |
+| AC / DC power monitors | Voltage, current (+ charge, time remaining for DC) | 🧪 Experimental |
+| Chassis info | Park brake, ignition, towable battery / brake voltage | 🧪 Experimental |
+| Door locks | Lock state + battery (**read-only**) | 🧪 Experimental |
+
+✅ = tested on real hardware. 🧪 = implemented from the app's code but not yet tested on a
+real device — please open an issue with a debug log (see Troubleshooting) whether it works or not.
+
+**Not supported:** levelers (the app drives them through a multi-screen guided state machine;
+getting that wrong moves jacks), door lock *control* (uses a different, unverified write path),
+and accessories that talk to the phone directly rather than through the console (TPMS, Mopeka
+tank sensors, awning wind sensors).
+
+Also on the device page: **Connection Status** and **Fault Status** (decoded fault codes),
+**Pair / Re-pair Console**, **Emergency Stop** (halts every moving cover), **Clear All Faults**,
+and **HA Console Control** (hand the console to the phone app and back).
 
 Devices are found by their stable function name ("Ceiling Light", "Awning", …), not their bus
 address, so entities survive the console being power-cycled.
 
 ## Compatibility
 
-- Consoles that advertise over Bluetooth as **`LCIRemotec…`** (IDS-CAN gateway). Tested on a
-  single console (part 26429-C). Reports from other models are welcome.
+- Consoles that advertise over Bluetooth as **`LCIRemotec…`** (IDS-CAN gateway). Developed on
+  a single console (part 26429-C). Reports from other models are welcome.
 - **Not** for the WiFi "MyRvLink" OneControl gateways; those use a different protocol.
 
 ## Requirements
@@ -96,6 +125,13 @@ Connect → KeySeed unlock → join the IDS-CAN bus as a node (address claim + p
 heartbeat) → open a short RemoteControl session with the target device → send the command.
 See `custom_components/compass_console/compass_ble.py`; it also runs standalone:
 `python compass_ble.py <MAC> list`.
+
+## Development
+
+`protocol.py` holds every status decoder and command encoder with no Bluetooth or Home
+Assistant imports. Tests: `pip install pytest-homeassistant-custom-component` then `pytest`.
+`tests/test_protocol.py` covers the byte formats (including real captures from a console);
+`tests/test_ha.py` loads the integration into Home Assistant against a simulated bus.
 
 ## License
 

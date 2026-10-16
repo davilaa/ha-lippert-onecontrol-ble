@@ -16,6 +16,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from . import protocol as P
 from .const import DOMAIN, FUNC_ICONS, RELEASED_OPT, SWITCH_DEFAULT_ICON
 from .coordinator import CompassCoordinator
 
@@ -29,17 +30,23 @@ async def async_setup_entry(
 ) -> None:
     coordinator: CompassCoordinator = hass.data[DOMAIN][entry.entry_id]
     known: set = set()
+    used_ids: set = set()
 
     # One-time master control: hand the console between HA and the phone app.
     async_add_entities([CompassControlSwitch(coordinator, entry)])
 
     @callback
     def _sync() -> None:
-        new = [
-            CompassSwitch(coordinator, dev)
-            for dev in (coordinator.data or {}).values()
-            if dev.is_switch and not (dev.key in known or known.add(dev.key))
-        ]
+        new = []
+        for dev in (coordinator.data or {}).values():
+            if dev.key in known:
+                continue
+            if dev.is_switch:
+                known.add(dev.key)
+                new.append(CompassSwitch(coordinator, dev, used_ids))
+            elif dev.kind == P.K_GENERATOR:
+                known.add(dev.key)
+                new.append(CompassGeneratorSwitch(coordinator, dev))
         if new:
             async_add_entities(new)
 
@@ -115,13 +122,20 @@ class CompassSwitch(CoordinatorEntity[CompassCoordinator], SwitchEntity):
 
     _attr_has_entity_name = False
 
-    def __init__(self, coordinator: CompassCoordinator, device) -> None:
+    def __init__(self, coordinator: CompassCoordinator, device, used_ids: set) -> None:
         super().__init__(coordinator)
         self._key = device.key
-        self._func = device.func
         self._optimistic: bool | None = None
         self._optimistic_until: float = 0.0
-        self._attr_unique_id = f"{coordinator.address}_{device.func}"
+        # Original IDs were "<addr>_<function>"; keep that for function instance 0 so existing
+        # installs keep their entities, and disambiguate everything else.
+        uid = f"{coordinator.address}_{device.func}"
+        if device.finst:
+            uid = f"{uid}_{device.finst}"
+        if uid in used_ids:
+            uid = f"{coordinator.address}_{device.key}"
+        used_ids.add(uid)
+        self._attr_unique_id = uid
         self._attr_name = device.name
         self._attr_icon = FUNC_ICONS.get(device.func, SWITCH_DEFAULT_ICON)
         self._attr_device_info = DeviceInfo(
@@ -172,10 +186,70 @@ class CompassSwitch(CoordinatorEntity[CompassCoordinator], SwitchEntity):
 
     async def _bg_apply(self, on: bool) -> None:
         try:
-            await self.coordinator.client.async_set(f"func:{self._func}", on)
+            await self.coordinator.client.async_set(f"key:{self._key}", on)
         except Exception as err:  # noqa: BLE001
             _LOGGER.error("Compass %s turn %s failed: %s",
                           self._attr_name, "on" if on else "off", err)
             self._optimistic = None  # command failed -> defer to the device's real state
         await self.coordinator.async_request_refresh()
         self.async_write_ha_state()
+
+
+class CompassGeneratorSwitch(CoordinatorEntity[CompassCoordinator], SwitchEntity):
+    """Generator Genie: ON starts the generator (one press), OFF stops it."""
+
+    _attr_has_entity_name = False
+    _attr_icon = "mdi:engine"
+
+    def __init__(self, coordinator: CompassCoordinator, device) -> None:
+        super().__init__(coordinator)
+        self._key = device.key
+        self._attr_unique_id = f"{coordinator.address}_generator_{device.key}"
+        self._attr_name = device.name
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, coordinator.address)},
+            name="Compass Console",
+            manufacturer="Lippert / IDS",
+            model="OneControl IDS-CAN gateway",
+        )
+
+    @property
+    def _data(self):
+        dev = (self.coordinator.data or {}).get(self._key)
+        return dev.data if dev else None
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._data is not None
+
+    @property
+    def is_on(self) -> bool | None:
+        d = self._data
+        return d["state"] in ("priming", "starting", "running") if d else None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        d = self._data or {}
+        return {"generator_state": d.get("state"), "quiet_hours": d.get("quiet_hours")}
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._send(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._send(False)
+
+    async def _send(self, on: bool) -> None:
+        def confirm(dev) -> bool:
+            d = dev.data
+            return bool(d) and ((d["state"] != "off") if on else (d["state"] == "off"))
+
+        try:
+            ok = await self.coordinator.client.async_command(
+                self._key, P.generator_cmd(on), confirm, timeout=5.0)
+            if not ok:
+                _LOGGER.warning("Compass %s: generator did not confirm %s",
+                                self._attr_name, "start" if on else "stop")
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Compass %s %s failed: %s", self._attr_name,
+                          "start" if on else "stop", err)
+        await self.coordinator.async_request_refresh()
