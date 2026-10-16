@@ -61,7 +61,10 @@ address, so entities survive the console being power-cycled.
 
 - Consoles that advertise over Bluetooth as **`LCIRemotec…`** (IDS-CAN gateway). Developed on
   a single console (part 26429-C). Reports from other models are welcome.
-- **Not** for the WiFi "MyRvLink" OneControl gateways; those use a different protocol.
+- **Not** for the WiFi "MyRvLink" OneControl gateways; those use a different protocol. If your
+  RV's OneControl has its own WiFi network, use
+  [manos/HomeAssistant-Lippert-OneControl-Integration](https://github.com/manos/HomeAssistant-Lippert-OneControl-Integration)
+  instead.
 
 ## Requirements
 
