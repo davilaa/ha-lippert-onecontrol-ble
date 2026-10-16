@@ -4,6 +4,13 @@ Control a Lippert **OneControl** RV system (the "Compass Console" panel used wit
 *Compass Connect* app) directly from Home Assistant over **Bluetooth LE**: no phone, no app,
 no cloud.
 
+**A note on testing:** I've only been able to test this with the devices in my own RV:
+on/off lights, water heaters, the water pump, slides, awnings and tank sensors. Support for
+everything else (dimmable and RGB lights, HVAC, generators, fans, battery monitors and more)
+is built from the same device code the official app uses, so it should work, but it hasn't
+been tried on real hardware yet. If you have one of those devices, please open an issue and
+say whether it worked; the [support table](#supported-devices) shows what's been confirmed.
+
 > Not affiliated with or endorsed by Lippert Components. The protocol was worked out
 > independently for interoperability. Use at your own risk, especially with slides and awnings.
 
